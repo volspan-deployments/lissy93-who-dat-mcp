@@ -7,9 +7,6 @@ from fastmcp import FastMCP
 import httpx
 import os
 from typing import Optional, List
-from dotenv import load_dotenv
-
-load_dotenv()
 
 mcp = FastMCP("Who-Dat")
 
@@ -17,24 +14,23 @@ BASE_URL = "https://who-dat.as93.net"
 AUTH_KEY = os.environ.get("AUTH_KEY", "")
 
 
-def _build_headers(api_key: Optional[str] = None) -> dict:
-    """Build authorization headers from env var or provided key."""
-    headers = {}
+def _get_headers(api_key: Optional[str] = None) -> dict:
+    """Build authorization headers, preferring tool-provided key over env var."""
     key = api_key or AUTH_KEY
-    if key:
-        if key.lower().startswith("bearer "):
-            headers["Authorization"] = key
-        else:
-            headers["Authorization"] = f"Bearer {key}"
-    return headers
+    if not key:
+        return {}
+    # Strip existing Bearer prefix if present
+    if key.lower().startswith("bearer "):
+        key = key[7:]
+    return {"Authorization": f"Bearer {key}"}
 
 
 @mcp.tool()
 async def check_health() -> dict:
-    """Ping the WHOIS API server to verify it is reachable and healthy. Use this before making other requests to confirm the service is up, or when diagnosing connectivity issues."""
-    async with httpx.AsyncClient() as client:
+    """Check if the Who-Dat WHOIS API service is up and running. Use this to verify connectivity before making domain lookups, or to diagnose service availability issues."""
+    async with httpx.AsyncClient(timeout=10.0) as client:
         try:
-            response = await client.get(f"{BASE_URL}/ping", timeout=10.0)
+            response = await client.get(f"{BASE_URL}/ping")
             return {
                 "status": "ok" if response.status_code == 200 else "error",
                 "status_code": response.status_code,
@@ -43,105 +39,68 @@ async def check_health() -> dict:
         except httpx.RequestError as e:
             return {
                 "status": "error",
-                "message": f"Request failed: {str(e)}"
+                "error": str(e)
             }
 
 
 @mcp.tool()
-async def lookup_domain(
-    domain: str,
-    api_key: Optional[str] = None
-) -> dict:
-    """Retrieve WHOIS registration information for a single domain name. Returns registrar details, registration/expiry dates, nameservers, registrant contact info, and domain status. Use this when the user wants to look up ownership, expiry, or registration details for one specific domain.
-
-    Args:
-        domain: The fully-qualified domain name to look up (e.g. 'example.com', 'google.co.uk'). Do not include protocol prefixes like 'http://'.
-        api_key: Authentication API key to include in the Authorization header. Required only when the server has AUTH_KEY configured. Can be a raw key or a Bearer token.
-    """
-    # Strip any protocol prefix just in case
-    domain = domain.strip()
-    for prefix in ["https://", "http://"]:
-        if domain.lower().startswith(prefix):
-            domain = domain[len(prefix):]
-    domain = domain.rstrip("/")
-
-    headers = _build_headers(api_key)
-
-    async with httpx.AsyncClient() as client:
+async def lookup_domain(domain: str, api_key: Optional[str] = None) -> dict:
+    """Retrieve WHOIS information for a single domain name, including registrar, registration dates, nameservers, and registrant details. Use this when the user wants to look up ownership or registration info for one specific domain."""
+    headers = _get_headers(api_key)
+    async with httpx.AsyncClient(timeout=30.0) as client:
         try:
             response = await client.get(
                 f"{BASE_URL}/{domain}",
-                headers=headers,
-                timeout=30.0
+                headers=headers
             )
-            if response.status_code == 200:
-                try:
-                    return response.json()
-                except Exception:
-                    return {"status_code": response.status_code, "response": response.text}
-            else:
+            if response.status_code == 403:
                 return {
-                    "status_code": response.status_code,
-                    "error": response.text
+                    "error": "Authentication required or invalid API key.",
+                    "status_code": 403
                 }
+            if response.status_code != 200:
+                return {
+                    "error": f"Request failed with status {response.status_code}",
+                    "status_code": response.status_code,
+                    "detail": response.text
+                }
+            return response.json()
         except httpx.RequestError as e:
-            return {
-                "status": "error",
-                "message": f"Request failed: {str(e)}"
-            }
+            return {"error": str(e)}
+        except Exception as e:
+            return {"error": f"Unexpected error: {str(e)}"}
 
 
 @mcp.tool()
-async def lookup_multiple_domains(
-    domains: List[str],
-    api_key: Optional[str] = None
-) -> dict:
-    """Retrieve WHOIS information for multiple domains in a single batch request. Useful when the user wants to compare registration details, check expiry dates, or audit ownership across a list of domains. Note: subject to a 2-second server-side timeout, so keep the list reasonably short (under 10 domains recommended).
-
-    Args:
-        domains: List of domain names to look up (e.g. ['example.com', 'google.com', 'github.com']). Each should be a fully-qualified domain without protocol prefixes.
-        api_key: Authentication API key to include in the Authorization header. Required only when the server has AUTH_KEY configured.
-    """
-    # Clean domains
-    cleaned = []
-    for d in domains:
-        d = d.strip()
-        for prefix in ["https://", "http://"]:
-            if d.lower().startswith(prefix):
-                d = d[len(prefix):]
-        d = d.rstrip("/")
-        if d:
-            cleaned.append(d)
-
-    if not cleaned:
-        return {"error": "No valid domains provided"}
-
-    domains_param = ",".join(cleaned)
-    headers = _build_headers(api_key)
-
-    async with httpx.AsyncClient() as client:
+async def lookup_domains_bulk(domains: List[str], api_key: Optional[str] = None) -> dict:
+    """Retrieve WHOIS information for multiple domains concurrently in a single request. Use this when the user wants to compare registration details across several domains or check availability/ownership of multiple domains at once. Results are returned with a 2-second timeout per batch."""
+    if not domains:
+        return {"error": "No domains provided."}
+    headers = _get_headers(api_key)
+    domains_query = ",".join(domains)
+    async with httpx.AsyncClient(timeout=30.0) as client:
         try:
             response = await client.get(
                 f"{BASE_URL}/multi",
-                params={"domains": domains_param},
-                headers=headers,
-                timeout=15.0
+                params={"domains": domains_query},
+                headers=headers
             )
-            if response.status_code == 200:
-                try:
-                    return response.json()
-                except Exception:
-                    return {"status_code": response.status_code, "response": response.text}
-            else:
+            if response.status_code == 403:
                 return {
-                    "status_code": response.status_code,
-                    "error": response.text
+                    "error": "Authentication required or invalid API key.",
+                    "status_code": 403
                 }
+            if response.status_code != 200:
+                return {
+                    "error": f"Request failed with status {response.status_code}",
+                    "status_code": response.status_code,
+                    "detail": response.text
+                }
+            return response.json()
         except httpx.RequestError as e:
-            return {
-                "status": "error",
-                "message": f"Request failed: {str(e)}"
-            }
+            return {"error": str(e)}
+        except Exception as e:
+            return {"error": f"Unexpected error: {str(e)}"}
 
 
 
@@ -175,5 +134,6 @@ app = Starlette(
     ],
     lifespan=sse_app.lifespan,
 )
+
 if __name__ == "__main__":
     uvicorn.run(app, host="0.0.0.0", port=int(os.environ.get("PORT", 8000)))
