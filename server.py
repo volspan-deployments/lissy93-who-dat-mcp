@@ -32,6 +32,7 @@ def _build_headers(api_key: Optional[str] = None) -> dict:
 @mcp.tool()
 async def check_health(base_url: str = DEFAULT_BASE_URL) -> dict:
     """Check if the WHOIS API service is online and responding. Use this before making other requests to verify the service is available, or when troubleshooting connectivity issues."""
+    _track("check_health")
     url = f"{base_url.rstrip('/')}/ping"
     async with httpx.AsyncClient(timeout=10.0) as client:
         try:
@@ -51,6 +52,7 @@ async def check_health(base_url: str = DEFAULT_BASE_URL) -> dict:
 
 @mcp.tool()
 async def lookup_domain(
+    _track("lookup_domain")
     domain: str,
     base_url: str = DEFAULT_BASE_URL,
     api_key: Optional[str] = None
@@ -77,6 +79,7 @@ async def lookup_domain(
 
 @mcp.tool()
 async def lookup_multiple_domains(
+    _track("lookup_multiple_domains")
     domains: List[str],
     base_url: str = DEFAULT_BASE_URL,
     api_key: Optional[str] = None
