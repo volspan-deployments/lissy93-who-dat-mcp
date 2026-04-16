@@ -17,20 +17,21 @@ BASE_URL = "https://who-dat.as93.net"
 AUTH_KEY = os.environ.get("AUTH_KEY", "")
 
 
-def get_auth_headers(authorization: Optional[str] = None) -> dict:
-    """Build authentication headers."""
+def build_headers(api_key: Optional[str] = None) -> dict:
+    """Build authorization headers."""
     headers = {}
-    if authorization:
-        # Use the provided authorization header as-is
-        headers["Authorization"] = authorization
-    elif AUTH_KEY:
-        headers["Authorization"] = f"Bearer {AUTH_KEY}"
+    key = api_key or AUTH_KEY
+    if key:
+        # Strip existing Bearer prefix if present to normalize
+        if key.lower().startswith("bearer "):
+            key = key[7:]
+        headers["Authorization"] = f"Bearer {key}"
     return headers
 
 
 @mcp.tool()
 async def check_health() -> dict:
-    """Ping the API to verify it is running and reachable. Use this before making other requests to confirm the service is available, or to diagnose connectivity issues."""
+    """Check if the WHOIS API service is alive and responding. Use this before making other requests to verify the service is up, or when troubleshooting connectivity issues."""
     async with httpx.AsyncClient() as client:
         try:
             response = await client.get(f"{BASE_URL}/ping", timeout=10.0)
@@ -42,62 +43,54 @@ async def check_health() -> dict:
         except httpx.RequestError as e:
             return {
                 "status": "error",
-                "message": str(e)
+                "error": str(e)
             }
 
 
 @mcp.tool()
-async def get_whois(
-    domain: str,
-    authorization: Optional[str] = None
-) -> dict:
-    """Fetch WHOIS registration information for a single domain name. Use this to look up ownership, registrar, creation/expiration dates, nameservers, and other domain metadata for one specific domain."""
-    if not domain:
-        return {"error": "Domain parameter is required"}
+async def lookup_domain(domain: str, api_key: Optional[str] = None) -> dict:
+    """Look up WHOIS information for a single domain name. Returns registration details including registrar, creation date, expiration date, name servers, and registrant information. Use this when you need detailed WHOIS data for one specific domain.
 
-    # Strip protocol if present
-    domain = domain.replace("http://", "").replace("https://", "").strip("/")
-
-    headers = get_auth_headers(authorization)
-
+    Args:
+        domain: The fully qualified domain name to look up (e.g. 'example.com', 'google.co.uk')
+        api_key: API key for authentication, required only if the server is configured with AUTH_KEY. Can be a raw key or Bearer token.
+    """
+    headers = build_headers(api_key)
     async with httpx.AsyncClient() as client:
         try:
             response = await client.get(
                 f"{BASE_URL}/{domain}",
                 headers=headers,
-                timeout=30.0
+                timeout=15.0
             )
             if response.status_code == 200:
-                try:
-                    return response.json()
-                except Exception:
-                    return {"response": response.text}
+                return response.json()
             else:
                 return {
-                    "error": f"Request failed with status {response.status_code}",
-                    "detail": response.text
+                    "error": response.text,
+                    "status_code": response.status_code,
+                    "domain": domain
                 }
         except httpx.RequestError as e:
-            return {"error": str(e)}
+            return {
+                "error": str(e),
+                "domain": domain
+            }
 
 
 @mcp.tool()
-async def get_whois_multi(
-    domains: List[str],
-    authorization: Optional[str] = None
-) -> dict:
-    """Fetch WHOIS information for multiple domains in a single request. Use this when you need to look up and compare registration details for several domains at once. Results are returned within a 2-second timeout."""
+async def lookup_multiple_domains(domains: List[str], api_key: Optional[str] = None) -> dict:
+    """Look up WHOIS information for multiple domains in a single request. More efficient than calling lookup_domain repeatedly. Has a 2-second timeout, so use for reasonably sized batches. Use this when comparing domain registrations or checking ownership across a list of domains.
+
+    Args:
+        domains: List of domain names to look up (e.g. ['example.com', 'google.com', 'github.com']). Will be sent as a comma-separated query parameter.
+        api_key: API key for authentication, required only if the server is configured with AUTH_KEY. Can be a raw key or Bearer token.
+    """
     if not domains:
-        return {"error": "At least one domain is required"}
+        return {"error": "No domains provided"}
 
-    # Strip protocols from all domains
-    cleaned_domains = [
-        d.replace("http://", "").replace("https://", "").strip("/")
-        for d in domains
-    ]
-
-    domains_param = ",".join(cleaned_domains)
-    headers = get_auth_headers(authorization)
+    headers = build_headers(api_key)
+    domains_param = ",".join(domains)
 
     async with httpx.AsyncClient() as client:
         try:
@@ -105,20 +98,26 @@ async def get_whois_multi(
                 f"{BASE_URL}/multi",
                 params={"domains": domains_param},
                 headers=headers,
-                timeout=30.0
+                timeout=10.0
             )
             if response.status_code == 200:
-                try:
-                    return response.json()
-                except Exception:
-                    return {"response": response.text}
+                return response.json()
             else:
                 return {
-                    "error": f"Request failed with status {response.status_code}",
-                    "detail": response.text
+                    "error": response.text,
+                    "status_code": response.status_code,
+                    "domains": domains
                 }
+        except httpx.TimeoutException:
+            return {
+                "error": "Request timed out. The multi-domain endpoint has a 2-second server-side timeout. Try fewer domains.",
+                "domains": domains
+            }
         except httpx.RequestError as e:
-            return {"error": str(e)}
+            return {
+                "error": str(e),
+                "domains": domains
+            }
 
 
 
