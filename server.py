@@ -13,83 +13,135 @@ load_dotenv()
 
 mcp = FastMCP("Who-Dat")
 
-BASE_URL = os.environ.get("WHO_DAT_BASE_URL", "http://localhost:8080")
+BASE_URL = "https://who-dat.as93.net"
 AUTH_KEY = os.environ.get("AUTH_KEY", "")
 
 
-def _get_headers(api_key: Optional[str] = None) -> dict:
-    """Build authorization headers using provided api_key or fallback to AUTH_KEY env var."""
+def _build_headers(api_key: Optional[str] = None) -> dict:
+    """Build authorization headers from env var or provided key."""
+    headers = {}
     key = api_key or AUTH_KEY
     if key:
-        return {"Authorization": f"Bearer {key}"}
-    return {}
-
-
-@mcp.tool()
-async def whois_lookup(domain: str, api_key: Optional[str] = None) -> dict:
-    """Look up WHOIS information for a single domain name. Use this when the user wants to know
-    registration details, expiry dates, registrar info, nameservers, or ownership details for one
-    specific domain."""
-    headers = _get_headers(api_key)
-    url = f"{BASE_URL}/{domain}"
-    async with httpx.AsyncClient(timeout=30.0) as client:
-        response = await client.get(url, headers=headers)
-        if response.status_code == 200:
-            try:
-                return response.json()
-            except Exception:
-                return {"result": response.text}
+        if key.lower().startswith("bearer "):
+            headers["Authorization"] = key
         else:
-            return {
-                "error": f"Request failed with status {response.status_code}",
-                "detail": response.text
-            }
+            headers["Authorization"] = f"Bearer {key}"
+    return headers
 
 
 @mcp.tool()
-async def whois_lookup_multi(domains: List[str], api_key: Optional[str] = None) -> dict:
-    """Look up WHOIS information for multiple domains in a single request. Use this when the user
-    wants to compare or retrieve registration details for several domains at once. Note: has a
-    2-second timeout, so use for reasonably small batches."""
-    headers = _get_headers(api_key)
-    domains_param = ",".join(domains)
-    url = f"{BASE_URL}/multi"
-    async with httpx.AsyncClient(timeout=10.0) as client:
-        response = await client.get(url, params={"domains": domains_param}, headers=headers)
-        if response.status_code == 200:
-            try:
-                return response.json()
-            except Exception:
-                return {"result": response.text}
-        else:
-            return {
-                "error": f"Request failed with status {response.status_code}",
-                "detail": response.text
-            }
-
-
-@mcp.tool()
-async def health_check() -> dict:
-    """Check whether the WHOIS API server is online and responding. Use this to verify connectivity
-    or diagnose issues before making WHOIS queries."""
-    url = f"{BASE_URL}/ping"
-    async with httpx.AsyncClient(timeout=10.0) as client:
+async def check_health() -> dict:
+    """Ping the WHOIS API server to verify it is reachable and healthy. Use this before making other requests to confirm the service is up, or when diagnosing connectivity issues."""
+    async with httpx.AsyncClient() as client:
         try:
-            response = await client.get(url)
+            response = await client.get(f"{BASE_URL}/ping", timeout=10.0)
+            return {
+                "status": "ok" if response.status_code == 200 else "error",
+                "status_code": response.status_code,
+                "response": response.text
+            }
+        except httpx.RequestError as e:
+            return {
+                "status": "error",
+                "message": f"Request failed: {str(e)}"
+            }
+
+
+@mcp.tool()
+async def lookup_domain(
+    domain: str,
+    api_key: Optional[str] = None
+) -> dict:
+    """Retrieve WHOIS registration information for a single domain name. Returns registrar details, registration/expiry dates, nameservers, registrant contact info, and domain status. Use this when the user wants to look up ownership, expiry, or registration details for one specific domain.
+
+    Args:
+        domain: The fully-qualified domain name to look up (e.g. 'example.com', 'google.co.uk'). Do not include protocol prefixes like 'http://'.
+        api_key: Authentication API key to include in the Authorization header. Required only when the server has AUTH_KEY configured. Can be a raw key or a Bearer token.
+    """
+    # Strip any protocol prefix just in case
+    domain = domain.strip()
+    for prefix in ["https://", "http://"]:
+        if domain.lower().startswith(prefix):
+            domain = domain[len(prefix):]
+    domain = domain.rstrip("/")
+
+    headers = _build_headers(api_key)
+
+    async with httpx.AsyncClient() as client:
+        try:
+            response = await client.get(
+                f"{BASE_URL}/{domain}",
+                headers=headers,
+                timeout=30.0
+            )
             if response.status_code == 200:
-                return {"status": "online", "message": response.text}
+                try:
+                    return response.json()
+                except Exception:
+                    return {"status_code": response.status_code, "response": response.text}
             else:
                 return {
-                    "status": "error",
-                    "message": f"Unexpected status code: {response.status_code}",
-                    "detail": response.text
+                    "status_code": response.status_code,
+                    "error": response.text
                 }
-        except httpx.ConnectError as e:
-            return {"status": "offline", "message": f"Could not connect to server: {str(e)}"}
-        except httpx.TimeoutException as e:
-            return {"status": "timeout", "message": f"Request timed out: {str(e)}"}
-        except Exception as e:
-            return {"status": "error", "message": str(e)}
+        except httpx.RequestError as e:
+            return {
+                "status": "error",
+                "message": f"Request failed: {str(e)}"
+            }
+
+
+@mcp.tool()
+async def lookup_multiple_domains(
+    domains: List[str],
+    api_key: Optional[str] = None
+) -> dict:
+    """Retrieve WHOIS information for multiple domains in a single batch request. Useful when the user wants to compare registration details, check expiry dates, or audit ownership across a list of domains. Note: subject to a 2-second server-side timeout, so keep the list reasonably short (under 10 domains recommended).
+
+    Args:
+        domains: List of domain names to look up (e.g. ['example.com', 'google.com', 'github.com']). Each should be a fully-qualified domain without protocol prefixes.
+        api_key: Authentication API key to include in the Authorization header. Required only when the server has AUTH_KEY configured.
+    """
+    # Clean domains
+    cleaned = []
+    for d in domains:
+        d = d.strip()
+        for prefix in ["https://", "http://"]:
+            if d.lower().startswith(prefix):
+                d = d[len(prefix):]
+        d = d.rstrip("/")
+        if d:
+            cleaned.append(d)
+
+    if not cleaned:
+        return {"error": "No valid domains provided"}
+
+    domains_param = ",".join(cleaned)
+    headers = _build_headers(api_key)
+
+    async with httpx.AsyncClient() as client:
+        try:
+            response = await client.get(
+                f"{BASE_URL}/multi",
+                params={"domains": domains_param},
+                headers=headers,
+                timeout=15.0
+            )
+            if response.status_code == 200:
+                try:
+                    return response.json()
+                except Exception:
+                    return {"status_code": response.status_code, "response": response.text}
+            else:
+                return {
+                    "status_code": response.status_code,
+                    "error": response.text
+                }
+        except httpx.RequestError as e:
+            return {
+                "status": "error",
+                "message": f"Request failed: {str(e)}"
+            }
 
 
 
