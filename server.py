@@ -7,100 +7,127 @@ from fastmcp import FastMCP
 import httpx
 import os
 from typing import Optional, List
+from dotenv import load_dotenv
 
-mcp = FastMCP("Who-Dat")
+load_dotenv()
+
+mcp = FastMCP("Who-Dat WHOIS Lookup")
 
 BASE_URL = "https://who-dat.as93.net"
-AUTH_KEY = os.environ.get("AUTH_KEY", "")
+DEFAULT_AUTH_KEY = os.environ.get("AUTH_KEY", "")
 
 
-def _get_headers(api_key: Optional[str] = None) -> dict:
-    """Build authorization headers, preferring tool-provided key over env var."""
-    key = api_key or AUTH_KEY
-    if not key:
-        return {}
-    # Strip existing Bearer prefix if present
-    if key.lower().startswith("bearer "):
-        key = key[7:]
-    return {"Authorization": f"Bearer {key}"}
-
-
-@mcp.tool()
-async def check_health() -> dict:
-    """Check if the Who-Dat WHOIS API service is up and running. Use this to verify connectivity before making domain lookups, or to diagnose service availability issues."""
-    async with httpx.AsyncClient(timeout=10.0) as client:
-        try:
-            response = await client.get(f"{BASE_URL}/ping")
-            return {
-                "status": "ok" if response.status_code == 200 else "error",
-                "status_code": response.status_code,
-                "response": response.text
-            }
-        except httpx.RequestError as e:
-            return {
-                "status": "error",
-                "error": str(e)
-            }
+def _build_headers(api_key: Optional[str] = None) -> dict:
+    """Build request headers, adding Bearer auth if an API key is available."""
+    headers = {}
+    key = api_key or DEFAULT_AUTH_KEY
+    if key:
+        headers["Authorization"] = f"Bearer {key}"
+    return headers
 
 
 @mcp.tool()
-async def lookup_domain(domain: str, api_key: Optional[str] = None) -> dict:
-    """Retrieve WHOIS information for a single domain name, including registrar, registration dates, nameservers, and registrant details. Use this when the user wants to look up ownership or registration info for one specific domain."""
-    headers = _get_headers(api_key)
+async def whois_lookup(domain: str, api_key: Optional[str] = None) -> dict:
+    """
+    Look up WHOIS information for a single domain. Use this when the user wants
+    to find registration details, expiry dates, registrar info, nameservers, or
+    ownership information for one specific domain.
+
+    Args:
+        domain: The fully qualified domain name to look up (e.g., 'example.com', 'google.com').
+        api_key: Optional API key for authentication. Will be sent as a Bearer token.
+    """
+    headers = _build_headers(api_key)
+    url = f"{BASE_URL}/{domain}"
+
     async with httpx.AsyncClient(timeout=30.0) as client:
-        try:
-            response = await client.get(
-                f"{BASE_URL}/{domain}",
-                headers=headers
-            )
-            if response.status_code == 403:
-                return {
-                    "error": "Authentication required or invalid API key.",
-                    "status_code": 403
-                }
-            if response.status_code != 200:
-                return {
-                    "error": f"Request failed with status {response.status_code}",
-                    "status_code": response.status_code,
-                    "detail": response.text
-                }
-            return response.json()
-        except httpx.RequestError as e:
-            return {"error": str(e)}
-        except Exception as e:
-            return {"error": f"Unexpected error: {str(e)}"}
+        response = await client.get(url, headers=headers)
+
+    if response.status_code == 403:
+        return {"error": "Authentication required or invalid API key.", "status_code": 403}
+    if response.status_code == 400:
+        return {"error": "Bad request. Please provide a valid domain name.", "status_code": 400}
+    if not response.is_success:
+        return {
+            "error": f"Request failed with status {response.status_code}",
+            "status_code": response.status_code,
+            "detail": response.text,
+        }
+
+    try:
+        return response.json()
+    except Exception:
+        return {"raw": response.text}
 
 
 @mcp.tool()
-async def lookup_domains_bulk(domains: List[str], api_key: Optional[str] = None) -> dict:
-    """Retrieve WHOIS information for multiple domains concurrently in a single request. Use this when the user wants to compare registration details across several domains or check availability/ownership of multiple domains at once. Results are returned with a 2-second timeout per batch."""
+async def whois_lookup_multi(domains: List[str], api_key: Optional[str] = None) -> dict:
+    """
+    Look up WHOIS information for multiple domains in a single request. Use this
+    when the user wants to compare or batch-check registration details for several
+    domains at once. Note: subject to a 2-second server-side timeout, so keep
+    the list reasonably short.
+
+    Args:
+        domains: List of domain names to look up (e.g., ['example.com', 'google.com']).
+        api_key: Optional API key for authentication. Will be sent as a Bearer token.
+    """
     if not domains:
-        return {"error": "No domains provided."}
-    headers = _get_headers(api_key)
-    domains_query = ",".join(domains)
+        return {"error": "No domains provided. Please supply at least one domain."}
+
+    headers = _build_headers(api_key)
+    domains_param = ",".join(d.strip() for d in domains)
+    url = f"{BASE_URL}/multi"
+    params = {"domains": domains_param}
+
     async with httpx.AsyncClient(timeout=30.0) as client:
-        try:
-            response = await client.get(
-                f"{BASE_URL}/multi",
-                params={"domains": domains_query},
-                headers=headers
-            )
-            if response.status_code == 403:
-                return {
-                    "error": "Authentication required or invalid API key.",
-                    "status_code": 403
-                }
-            if response.status_code != 200:
-                return {
-                    "error": f"Request failed with status {response.status_code}",
-                    "status_code": response.status_code,
-                    "detail": response.text
-                }
-            return response.json()
-        except httpx.RequestError as e:
-            return {"error": str(e)}
-        except Exception as e:
-            return {"error": f"Unexpected error: {str(e)}"}
+        response = await client.get(url, headers=headers, params=params)
+
+    if response.status_code == 403:
+        return {"error": "Authentication required or invalid API key.", "status_code": 403}
+    if response.status_code == 400:
+        return {"error": "Bad request. Please provide valid domain names.", "status_code": 400}
+    if not response.is_success:
+        return {
+            "error": f"Request failed with status {response.status_code}",
+            "status_code": response.status_code,
+            "detail": response.text,
+        }
+
+    try:
+        return response.json()
+    except Exception:
+        return {"raw": response.text}
+
+
+@mcp.tool()
+async def health_check() -> dict:
+    """
+    Check if the WHOIS API server is reachable and healthy. Use this to verify
+    connectivity before making other requests, or when the user asks if the
+    service is up.
+    """
+    url = f"{BASE_URL}/ping"
+
+    try:
+        async with httpx.AsyncClient(timeout=10.0) as client:
+            response = await client.get(url)
+
+        if response.is_success and response.text.strip().lower() == "pong":
+            return {"status": "healthy", "message": "API is reachable and responding correctly.", "response": response.text.strip()}
+        else:
+            return {
+                "status": "unhealthy",
+                "message": f"Unexpected response from API.",
+                "status_code": response.status_code,
+                "response": response.text.strip(),
+            }
+    except httpx.ConnectError:
+        return {"status": "unreachable", "message": "Could not connect to the WHOIS API server."}
+    except httpx.TimeoutException:
+        return {"status": "timeout", "message": "Connection to the WHOIS API server timed out."}
+    except Exception as e:
+        return {"status": "error", "message": str(e)}
 
 
 
